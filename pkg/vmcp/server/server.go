@@ -1,0 +1,1265 @@
+// SPDX-FileCopyrightText: Copyright 2025 Stacklok, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package server implements the Virtual MCP Server that aggregates
+// multiple backend MCP servers into a unified interface.
+//
+// The server exposes aggregated capabilities (tools, resources, prompts)
+// and routes incoming MCP protocol requests to appropriate backend workloads.
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/mark3labs/mcp-go/server"
+
+	"github.com/stacklok/toolhive/pkg/audit"
+	"github.com/stacklok/toolhive/pkg/auth"
+	mcpparser "github.com/stacklok/toolhive/pkg/mcp"
+	"github.com/stacklok/toolhive/pkg/recovery"
+	"github.com/stacklok/toolhive/pkg/telemetry"
+	transportsession "github.com/stacklok/toolhive/pkg/transport/session"
+	"github.com/stacklok/toolhive/pkg/vmcp"
+	"github.com/stacklok/toolhive/pkg/vmcp/composer"
+	"github.com/stacklok/toolhive/pkg/vmcp/discovery"
+	"github.com/stacklok/toolhive/pkg/vmcp/health"
+	"github.com/stacklok/toolhive/pkg/vmcp/optimizer"
+	"github.com/stacklok/toolhive/pkg/vmcp/router"
+	"github.com/stacklok/toolhive/pkg/vmcp/server/adapter"
+	"github.com/stacklok/toolhive/pkg/vmcp/server/sessionmanager"
+	vmcpsession "github.com/stacklok/toolhive/pkg/vmcp/session"
+	vmcpstatus "github.com/stacklok/toolhive/pkg/vmcp/status"
+)
+
+const (
+	// defaultReadHeaderTimeout prevents slowloris attacks by limiting time to read request headers.
+	defaultReadHeaderTimeout = 10 * time.Second
+
+	// defaultReadTimeout is the maximum duration for reading the entire request, including body.
+	defaultReadTimeout = 30 * time.Second
+
+	// defaultWriteTimeout is the maximum duration before timing out writes of the response.
+	defaultWriteTimeout = 30 * time.Second
+
+	// defaultIdleTimeout is the maximum amount of time to wait for the next request when keep-alive's are enabled.
+	defaultIdleTimeout = 120 * time.Second
+
+	// defaultMaxHeaderBytes is the maximum size of request headers in bytes (1 MB).
+	defaultMaxHeaderBytes = 1 << 20
+
+	// defaultShutdownTimeout is the maximum time to wait for graceful shutdown.
+	defaultShutdownTimeout = 10 * time.Second
+
+	// defaultHeartbeatInterval sends SSE heartbeat pings on GET connections.
+	// Prevents proxies/load balancers from closing idle SSE connections.
+	defaultHeartbeatInterval = 30 * time.Second
+
+	// defaultSessionTTL is the default session time-to-live duration.
+	// Sessions that are inactive for this duration will be automatically cleaned up.
+	defaultSessionTTL = 30 * time.Minute
+)
+
+//go:generate mockgen -destination=mocks/mock_watcher.go -package=mocks -source=server.go Watcher
+
+// Watcher is the interface for Kubernetes backend watcher integration.
+// Used in dynamic mode (outgoingAuth.source: discovered) to gate readiness
+// on controller-runtime cache sync before serving requests.
+type Watcher interface {
+	// WaitForCacheSync waits for the Kubernetes informer caches to sync.
+	// Returns true if caches synced successfully, false on timeout or error.
+	WaitForCacheSync(ctx context.Context) bool
+}
+
+// Config holds the Virtual MCP Server configuration.
+type Config struct {
+	// Name is the server name exposed in MCP protocol
+	Name string
+
+	// Version is the server version
+	Version string
+
+	// GroupRef is the name of the MCPGroup containing backend workloads.
+	// Used for operational visibility in status endpoint and logging.
+	GroupRef string
+
+	// Host is the bind address (default: "127.0.0.1")
+	Host string
+
+	// Port is the bind port (default: 4483)
+	Port int
+
+	// EndpointPath is the MCP endpoint path (default: "/mcp")
+	EndpointPath string
+
+	// SessionTTL is the session time-to-live duration (default: 30 minutes)
+	// Sessions inactive for this duration will be automatically cleaned up
+	SessionTTL time.Duration
+
+	// AuthMiddleware is the optional authentication middleware to apply to MCP routes.
+	// If nil, no authentication is required.
+	// This should be a composed middleware chain (e.g., TokenValidator + MCP parser).
+	AuthMiddleware func(http.Handler) http.Handler
+
+	// AuthzMiddleware is the optional authorization middleware to apply AFTER discovery.
+	// Split from AuthMiddleware so authz can access discovered tool annotations
+	// injected by the annotation enrichment middleware.
+	// If nil, no authorization is performed.
+	AuthzMiddleware func(http.Handler) http.Handler
+
+	// AuthInfoHandler is the optional handler for /.well-known/oauth-protected-resource endpoint.
+	// Exposes OIDC discovery information about the protected resource.
+	AuthInfoHandler http.Handler
+
+	// TelemetryProvider is the optional telemetry provider.
+	// If nil, no telemetry is recorded.
+	TelemetryProvider *telemetry.Provider
+
+	// AuditConfig is the optional audit configuration.
+	// If nil, no audit logging is performed.
+	// Component should be set to "vmcp-server" to distinguish vMCP audit logs.
+	AuditConfig *audit.Config
+
+	// HealthMonitorConfig is the optional health monitoring configuration.
+	// If nil, health monitoring is disabled.
+	HealthMonitorConfig *health.MonitorConfig
+
+	// StatusReportingInterval is the interval for reporting status updates.
+	// If zero, defaults to 30 seconds.
+	// Lower values provide faster status updates but increase API server load.
+	StatusReportingInterval time.Duration
+
+	// Watcher is the optional Kubernetes backend watcher for dynamic mode.
+	// Only set when running in K8s with outgoingAuth.source: discovered.
+	// Used for /readyz endpoint to gate readiness on cache sync.
+	Watcher Watcher
+
+	// OptimizerFactory builds an optimizer from a list of tools.
+	// If not set, the optimizer is disabled.
+	OptimizerFactory func(context.Context, []server.ServerTool) (optimizer.Optimizer, error)
+
+	// OptimizerConfig holds the parsed optimizer search parameters (typed values).
+	// When non-nil, Start() creates the search store, wires the OptimizerFactory,
+	// and registers the store cleanup in shutdownFuncs.
+	// A nil value disables the optimizer.
+	OptimizerConfig *optimizer.Config
+
+	// StatusReporter enables vMCP runtime to report operational status.
+	// In Kubernetes mode: Updates VirtualMCPServer.Status (requires RBAC)
+	// In CLI mode: NoOpReporter (no persistent status)
+	// If nil, status reporting is disabled.
+	StatusReporter vmcpstatus.Reporter
+
+	// SessionFactory creates MultiSessions for session management.
+	// Required; must not be nil.
+	SessionFactory vmcpsession.MultiSessionFactory
+}
+
+// Server is the Virtual MCP Server that aggregates multiple backends.
+type Server struct {
+	config *Config
+
+	// MCP protocol server (mark3labs/mcp-go)
+	mcpServer *server.MCPServer
+
+	// HTTP server for Streamable HTTP transport
+	httpServer *http.Server
+
+	// Network listener (tracks actual bound port when using port 0)
+	listener   net.Listener
+	listenerMu sync.RWMutex
+
+	// Router for forwarding requests to backends
+	router router.Router
+
+	// Backend client for making requests to backends
+	backendClient vmcp.BackendClient
+
+	// Handler factory for creating MCP request handlers
+	handlerFactory *adapter.DefaultHandlerFactory
+
+	// Discovery manager for lazy per-user capability discovery
+	discoveryMgr discovery.Manager
+
+	// Backend registry for capability discovery
+	// For static mode (CLI), this is an immutable registry created from initial backends.
+	// For dynamic mode (K8s), this is a DynamicRegistry updated by the operator.
+	backendRegistry vmcp.BackendRegistry
+
+	// Session manager for tracking MCP protocol sessions
+	// This is ToolHive's session.Manager (pkg/transport/session) - the same component
+	// used by streamable proxy for MCP session tracking. It handles:
+	//   - Session storage and retrieval
+	//   - TTL-based cleanup of inactive sessions
+	//   - Session lifecycle management
+	sessionManager *transportsession.Manager
+
+	// Capability adapter for converting aggregator types to SDK types
+	capabilityAdapter *adapter.CapabilityAdapter
+
+	// vmcpSessionMgr manages session-scoped backend client lifecycle.
+	vmcpSessionMgr SessionManager
+
+	// Composite tool workflow definitions keyed by tool name.
+	// Initialized during construction and read-only thereafter.
+	// Thread-safety: Safe for concurrent reads (no writes after initialization).
+	workflowDefs map[string]*composer.WorkflowDefinition
+
+	// Workflow executors for composite tools (adapters around composer + definition).
+	// Used by capability adapter to create composite tool handlers.
+	// Initialized during construction and read-only thereafter.
+	// Thread-safety: Safe for concurrent reads (no writes after initialization).
+	workflowExecutors map[string]adapter.WorkflowExecutor
+
+	// Ready channel signals when the server is ready to accept connections.
+	// Closed once the listener is created and serving.
+	ready     chan struct{}
+	readyOnce sync.Once
+
+	// healthMonitor performs periodic health checks on backends.
+	// Nil if health monitoring is disabled.
+	// Protected by healthMonitorMu: RLock for reads (getter methods, HTTP handlers),
+	// Lock for writes (initialization, disabling on start failure).
+	healthMonitor   *health.Monitor
+	healthMonitorMu sync.RWMutex
+
+	// statusReporter enables vMCP to report operational status to control plane.
+	// Nil if status reporting is disabled.
+	statusReporter vmcpstatus.Reporter
+
+	// shutdownFuncs contains cleanup functions to run during Stop().
+	// Populated during Start() initialization before blocking; no mutex needed
+	// since Stop() is only called after Start()'s select returns.
+	shutdownFuncs []func(context.Context) error
+}
+
+// New creates a new Virtual MCP Server instance.
+//
+// The backendRegistry parameter provides the list of available backends:
+// - For static mode (CLI), pass an immutable registry created from initial backends
+// - For dynamic mode (K8s), pass a DynamicRegistry that will be updated by the operator
+//
+//nolint:gocyclo // Complexity from hook logic is acceptable
+func New(
+	ctx context.Context,
+	cfg *Config,
+	rt router.Router,
+	backendClient vmcp.BackendClient,
+	discoveryMgr discovery.Manager,
+	backendRegistry vmcp.BackendRegistry,
+	workflowDefs map[string]*composer.WorkflowDefinition,
+) (*Server, error) {
+	// Apply defaults
+	if cfg.Host == "" {
+		cfg.Host = "127.0.0.1"
+	}
+	// Note: Port 0 means "let OS assign random port" - intentionally no default applied here.
+	// CLI provides default via flag (4483), so Port is only 0 in tests for dynamic port assignment.
+	if cfg.EndpointPath == "" {
+		cfg.EndpointPath = "/mcp"
+	}
+	if cfg.Name == "" {
+		cfg.Name = "toolhive-vmcp"
+	}
+	if cfg.Version == "" {
+		cfg.Version = "0.1.0"
+	}
+	if cfg.SessionTTL == 0 {
+		cfg.SessionTTL = defaultSessionTTL
+	}
+
+	// Create hooks for SDK integration
+	hooks := &server.Hooks{}
+
+	// Create mark3labs MCP server
+	mcpServer := server.NewMCPServer(
+		cfg.Name,
+		cfg.Version,
+		server.WithToolCapabilities(false), // We'll register tools dynamically
+		server.WithResourceCapabilities(false, false), // We'll register resources dynamically
+		server.WithLogging(),
+		server.WithHooks(hooks),
+	)
+
+	// Create SDK elicitation adapter for workflow engine
+	// This wraps the mark3labs SDK to provide elicitation functionality to the composer
+	sdkElicitationRequester := newSDKElicitationAdapter(mcpServer)
+
+	// Create elicitation handler for workflow engine
+	// This provides SDK-agnostic elicitation with security validation
+	elicitationHandler := composer.NewDefaultElicitationHandler(sdkElicitationRequester)
+
+	// Decorate backend client with telemetry if provider is configured
+	// This must happen BEFORE creating the workflow engine so that workflow
+	// backend calls are instrumented when they occur during workflow execution.
+	if cfg.TelemetryProvider != nil {
+		var err error
+		// Get initial backends list from registry for telemetry setup
+		initialBackends := backendRegistry.List(ctx)
+		backendClient, err = monitorBackends(
+			ctx,
+			cfg.TelemetryProvider.MeterProvider(),
+			cfg.TelemetryProvider.TracerProvider(),
+			initialBackends,
+			backendClient,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to monitor backends: %w", err)
+		}
+	}
+
+	// Create workflow auditor if audit config is provided
+	var workflowAuditor *audit.WorkflowAuditor
+	if cfg.AuditConfig != nil {
+		if err := cfg.AuditConfig.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid audit configuration: %w", err)
+		}
+		var err error
+		workflowAuditor, err = audit.NewWorkflowAuditor(cfg.AuditConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create workflow auditor: %w", err)
+		}
+		slog.Info("workflow audit logging enabled")
+	}
+
+	// Create workflow engine (composer) for executing composite tools
+	// The composer orchestrates multi-step workflows across backends
+	// Use in-memory state store with 5-minute cleanup interval and 1-hour max age for completed workflows
+	stateStore := composer.NewInMemoryStateStore(5*time.Minute, 1*time.Hour)
+	workflowComposer := composer.NewWorkflowEngine(rt, backendClient, elicitationHandler, stateStore, workflowAuditor)
+
+	// Validate workflows and create executors (fail fast on invalid workflows)
+	var workflowExecutors map[string]adapter.WorkflowExecutor
+	var err error
+	workflowDefs, workflowExecutors, err = validateAndCreateExecutors(workflowComposer, workflowDefs)
+	if err != nil {
+		return nil, fmt.Errorf("workflow validation failed: %w", err)
+	}
+
+	// Decorate workflow executors with telemetry if provider is configured
+	if cfg.TelemetryProvider != nil && len(workflowExecutors) > 0 {
+		workflowExecutors, err = monitorWorkflowExecutors(
+			cfg.TelemetryProvider.MeterProvider(),
+			cfg.TelemetryProvider.TracerProvider(),
+			workflowExecutors,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to monitor workflow executors: %w", err)
+		}
+	}
+
+	// Create session manager using StreamableSession as the transport-layer placeholder.
+	// StreamableSession is a lightweight implementation of transportsession.Session that
+	// handles disconnect tracking, TTL, and metadata for Streamable HTTP connections.
+	// It intentionally carries no vmcp-specific state — backend connections, routing
+	// tables, tool lists, and token binding all live in the separate sessionmanager.Manager,
+	// keyed by the same session ID.
+	sessionManager := transportsession.NewManager(cfg.SessionTTL, transportsession.NewStreamableSession)
+
+	// Create handler factory (used by adapter and for future dynamic registration)
+	handlerFactory := adapter.NewDefaultHandlerFactory(rt, backendClient)
+
+	// Create capability adapter (single source of truth for converting aggregator types to SDK types)
+	capabilityAdapter := adapter.NewCapabilityAdapter(handlerFactory)
+
+	// Create health monitor if configured
+	var healthMon *health.Monitor
+	if cfg.HealthMonitorConfig != nil {
+		// Get initial backends list from registry for health monitoring setup
+		initialBackends := backendRegistry.List(ctx)
+		healthMon, err = health.NewMonitor(backendClient, initialBackends, *cfg.HealthMonitorConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create health monitor: %w", err)
+		}
+		slog.Info("health monitoring enabled",
+			"check_interval", cfg.HealthMonitorConfig.CheckInterval,
+			"unhealthy_threshold", cfg.HealthMonitorConfig.UnhealthyThreshold,
+			"timeout", cfg.HealthMonitorConfig.Timeout,
+			"degraded_threshold", cfg.HealthMonitorConfig.DegradedThreshold)
+	} else {
+		slog.Info("health monitoring disabled")
+	}
+
+	// Create session manager
+	if cfg.SessionFactory == nil {
+		return nil, fmt.Errorf("SessionFactory is required but was not provided")
+	}
+	vmcpSessMgr := sessionmanager.New(sessionManager, cfg.SessionFactory, backendRegistry)
+
+	// Create Server instance
+	srv := &Server{
+		config:            cfg,
+		mcpServer:         mcpServer,
+		router:            rt,
+		backendClient:     backendClient,
+		handlerFactory:    handlerFactory,
+		discoveryMgr:      discoveryMgr,
+		backendRegistry:   backendRegistry,
+		sessionManager:    sessionManager,
+		capabilityAdapter: capabilityAdapter,
+		workflowDefs:      workflowDefs,
+		workflowExecutors: workflowExecutors,
+		ready:             make(chan struct{}),
+		healthMonitor:     healthMon,
+		statusReporter:    cfg.StatusReporter,
+		vmcpSessionMgr:    vmcpSessMgr,
+	}
+
+	// Register OnRegisterSession hook to inject capabilities after SDK registers session.
+	// See handleSessionRegistration for implementation details.
+	hooks.AddOnRegisterSession(func(ctx context.Context, session server.ClientSession) {
+		srv.handleSessionRegistration(ctx, session)
+	})
+
+	return srv, nil
+}
+
+// Handler builds and returns the MCP HTTP handler without starting a listener.
+// This enables embedding the vmcp server inside another HTTP server or framework.
+//
+// The returned handler includes all routes (health, metrics, well-known, MCP)
+// and the full middleware chain (recovery, header validation, auth, audit,
+// discovery, backend enrichment, MCP parsing, telemetry).
+//
+// Each call builds a fresh handler. The method is safe to call multiple times.
+// All returned handlers share the same underlying MCPServer and SessionManager,
+// so callers should not serve concurrent traffic through multiple handlers.
+func (s *Server) Handler(_ context.Context) (http.Handler, error) {
+	// Create Streamable HTTP server with ToolHive session management
+	streamableServer := server.NewStreamableHTTPServer(
+		s.mcpServer,
+		server.WithEndpointPath(s.config.EndpointPath),
+		server.WithSessionIdManager(s.vmcpSessionMgr),
+		server.WithHeartbeatInterval(defaultHeartbeatInterval),
+	)
+
+	// Create HTTP mux with separated authenticated and unauthenticated routes
+	mux := http.NewServeMux()
+
+	// Unauthenticated health endpoints
+	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ping", s.handleHealth)
+	mux.HandleFunc("/readyz", s.handleReadiness)
+	mux.HandleFunc("/status", s.handleStatus)
+	mux.HandleFunc("/api/backends/health", s.handleBackendHealth)
+
+	// Optional Prometheus metrics endpoint (unauthenticated)
+	if s.config.TelemetryProvider != nil {
+		if prometheusHandler := s.config.TelemetryProvider.PrometheusHandler(); prometheusHandler != nil {
+			mux.Handle("/metrics", prometheusHandler)
+			slog.Info("prometheus metrics endpoint enabled at /metrics")
+		} else {
+			slog.Warn("prometheus metrics endpoint is not enabled, but telemetry provider is configured")
+		}
+	}
+
+	// Optional .well-known discovery endpoints (unauthenticated, RFC 9728 compliant)
+	// Handles /.well-known/oauth-protected-resource and subpaths (e.g., /mcp)
+	if wellKnownHandler := auth.NewWellKnownHandler(s.config.AuthInfoHandler); wellKnownHandler != nil {
+		mux.Handle("/.well-known/", wellKnownHandler)
+		slog.Info("rFC 9728 OAuth discovery endpoints enabled at /.well-known/")
+	}
+
+	// MCP endpoint - apply middleware chain (wrapping order, execution happens in reverse):
+	// Code wraps: auth+parser → audit → discovery → annotation-enrichment →
+	//   authz → backend-enrichment → MCP-parsing → telemetry
+	// Execution order: recovery → header-val → auth+parser → audit →
+	//   discovery → annotation-enrichment → authz → backend-enrichment →
+	//   MCP-parsing → telemetry → handler
+
+	var mcpHandler http.Handler = streamableServer
+
+	if s.config.TelemetryProvider != nil {
+		mcpHandler = s.config.TelemetryProvider.Middleware(s.config.Name, "streamable-http")(mcpHandler)
+		slog.Info("telemetry middleware enabled for MCP endpoints")
+	}
+
+	// Apply MCP parsing middleware to extract JSON-RPC method from request body.
+	// This runs before telemetry so that recordMetrics can label metrics with the
+	// actual mcp_method (e.g. "tools/call", "initialize") instead of "unknown".
+	// Note: ParsingMiddleware is also composed inside the auth middleware (for audit/authz).
+	// The second application here is a no-op because the context already holds a
+	// ParsedMCPRequest; it exists only so the telemetry layer works correctly even
+	// when auth middleware is nil.
+	mcpHandler = mcpparser.ParsingMiddleware(mcpHandler)
+
+	// Apply backend enrichment middleware if audit is configured
+	// This runs after discovery populates the routing table, so it can extract backend names
+	if s.config.AuditConfig != nil {
+		mcpHandler = s.backendEnrichmentMiddleware(mcpHandler)
+		slog.Info("backend enrichment middleware enabled for audit events")
+	}
+
+	// Apply authorization middleware if configured (runs AFTER discovery in execution).
+	// Wrapping it here (before discovery wrap) means discovery runs first, then authz.
+	if s.config.AuthzMiddleware != nil {
+		mcpHandler = s.config.AuthzMiddleware(mcpHandler)
+		slog.Info("authorization middleware enabled for MCP endpoints (post-discovery)")
+	}
+
+	// Apply annotation enrichment middleware (runs after discovery, before authz in execution).
+	// Reads tool annotations from discovered capabilities and injects them into the
+	// request context so the authz middleware can make annotation-aware decisions.
+	if s.config.AuthzMiddleware != nil {
+		mcpHandler = AnnotationEnrichmentMiddleware(mcpHandler)
+		slog.Info("annotation enrichment middleware enabled for MCP endpoints")
+	}
+
+	// Apply discovery middleware (runs after audit/auth middleware)
+	// Discovery middleware performs per-request capability aggregation with user context
+	// Pass sessionManager to enable session-based capability retrieval for subsequent requests
+	// The backend registry provides dynamic backend list (supports DynamicRegistry for K8s)
+	// Pass health monitor to enable filtering based on current health status (respects circuit breaker)
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	var healthStatusProvider health.StatusProvider
+	if healthMon != nil {
+		healthStatusProvider = healthMon
+	}
+	mcpHandler = discovery.Middleware(
+		s.discoveryMgr, s.backendRegistry, s.sessionManager, healthStatusProvider,
+		discovery.WithSessionScopedRouting(),
+	)(mcpHandler)
+	slog.Info("discovery middleware enabled for lazy per-user capability discovery")
+
+	// Apply audit middleware if configured (runs after auth, before discovery)
+	if s.config.AuditConfig != nil {
+		if err := s.config.AuditConfig.Validate(); err != nil {
+			return nil, fmt.Errorf("invalid audit configuration: %w", err)
+		}
+		auditor, err := audit.NewAuditorWithTransport(
+			s.config.AuditConfig,
+			"streamable-http", // vMCP uses streamable HTTP transport
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create auditor: %w", err)
+		}
+		mcpHandler = auditor.Middleware(mcpHandler)
+		slog.Info("audit middleware enabled for MCP endpoints")
+	}
+
+	// Apply authentication middleware if configured (runs first in chain)
+	if s.config.AuthMiddleware != nil {
+		mcpHandler = s.config.AuthMiddleware(mcpHandler)
+		slog.Info("authentication middleware enabled for MCP endpoints")
+	}
+
+	// Apply Accept header validation (rejects GET requests without Accept: text/event-stream)
+	mcpHandler = headerValidatingMiddleware(mcpHandler)
+
+	// Apply recovery middleware as outermost (catches panics from all inner middleware)
+	mcpHandler = recovery.Middleware(mcpHandler)
+	slog.Info("recovery middleware enabled for MCP endpoints")
+
+	mux.Handle("/", mcpHandler)
+
+	return mux, nil
+}
+
+// Start starts the Virtual MCP Server and begins serving requests.
+//
+//nolint:gocyclo // Complexity from health monitoring and startup orchestration is acceptable
+func (s *Server) Start(ctx context.Context) error {
+	// Create optimizer store and wire factory if optimizer is configured
+	if s.config.OptimizerConfig != nil {
+		factory, cleanup, err := optimizer.NewOptimizerFactory(s.config.OptimizerConfig)
+		if err != nil {
+			return err
+		}
+		s.shutdownFuncs = append(s.shutdownFuncs, cleanup)
+		s.config.OptimizerFactory = factory
+
+		if s.config.TelemetryProvider != nil {
+			s.config.OptimizerFactory, err = monitorOptimizer(
+				s.config.TelemetryProvider.MeterProvider(),
+				s.config.TelemetryProvider.TracerProvider(),
+				s.config.OptimizerFactory,
+			)
+			if err != nil {
+				return fmt.Errorf("failed to monitor optimizer: %w", err)
+			}
+		}
+	}
+
+	// Build the HTTP handler (middleware chain, routes, mux)
+	handler, err := s.Handler(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to build handler: %w", err)
+	}
+
+	// Create HTTP server
+	addr := fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+	s.httpServer = &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: defaultReadHeaderTimeout,
+		ReadTimeout:       defaultReadTimeout,
+		WriteTimeout:      defaultWriteTimeout,
+		IdleTimeout:       defaultIdleTimeout,
+		MaxHeaderBytes:    defaultMaxHeaderBytes,
+	}
+
+	// Create listener (allows port 0 to bind to random available port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to create listener: %w", err)
+	}
+
+	s.listenerMu.Lock()
+	s.listener = listener
+	s.listenerMu.Unlock()
+
+	actualAddr := listener.Addr().String()
+	slog.Info("starting Virtual MCP Server", "address", actualAddr, "endpoint", s.config.EndpointPath)
+	slog.Info("health endpoints available",
+		"health", actualAddr+"/health",
+		"ping", actualAddr+"/ping",
+		"status", actualAddr+"/status",
+		"backends_health", actualAddr+"/api/backends/health")
+
+	// Start server in background
+	errCh := make(chan error, 1)
+	go func() {
+		if err := s.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errCh <- fmt.Errorf("HTTP server error: %w", err)
+		}
+	}()
+
+	// Signal that the server is ready (listener created and serving started)
+	s.readyOnce.Do(func() {
+		close(s.ready)
+	})
+
+	// Start health monitor if configured
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	if healthMon != nil {
+		if err := healthMon.Start(ctx); err != nil {
+			// Log error and disable health monitoring - treat as if it wasn't configured
+			// This ensures getter methods correctly report monitoring as disabled
+			slog.Warn("failed to start health monitor, disabling health monitoring", "error", err)
+			s.healthMonitorMu.Lock()
+			s.healthMonitor = nil
+			s.healthMonitorMu.Unlock()
+		} else {
+			slog.Info("health monitor started")
+		}
+	}
+
+	// Start status reporter if configured
+	if s.statusReporter != nil {
+		shutdown, err := s.statusReporter.Start(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to start status reporter: %w", err)
+		}
+		s.shutdownFuncs = append(s.shutdownFuncs, shutdown)
+
+		// Create internal context for status reporting goroutine lifecycle
+		// This ensures the goroutine is cleaned up on all exit paths
+		statusReportingCtx, statusReportingCancel := context.WithCancel(ctx)
+
+		// Prepare status reporting config
+		statusConfig := DefaultStatusReportingConfig()
+		statusConfig.Reporter = s.statusReporter
+		if s.config.StatusReportingInterval > 0 {
+			statusConfig.Interval = s.config.StatusReportingInterval
+		}
+
+		// Start periodic status reporting in background
+		go s.periodicStatusReporting(statusReportingCtx, statusConfig)
+
+		// Append cancel function to shutdownFuncs for cleanup
+		// Done after starting goroutine to avoid race if Stop() is called immediately
+		s.shutdownFuncs = append(s.shutdownFuncs, func(context.Context) error {
+			statusReportingCancel()
+			return nil
+		})
+	}
+
+	// Wait for either context cancellation or server error
+	select {
+	case <-ctx.Done():
+		slog.Info("context cancelled, shutting down server")
+		return s.Stop(context.Background())
+	case err := <-errCh:
+		// HTTP server error - log and tear down cleanly
+		slog.Error("hTTP server error", "error", err)
+		if stopErr := s.Stop(context.Background()); stopErr != nil {
+			// Combine errors if Stop() also fails
+			return fmt.Errorf("server error: %w; stop error: %v", err, stopErr)
+		}
+		return err
+	}
+}
+
+// Stop gracefully stops the Virtual MCP Server.
+func (s *Server) Stop(ctx context.Context) error {
+	slog.Info("stopping Virtual MCP Server")
+
+	var errs []error
+
+	// Stop HTTP server (this internally closes the listener)
+	if s.httpServer != nil {
+		// Create shutdown context with timeout
+		shutdownCtx, cancel := context.WithTimeout(ctx, defaultShutdownTimeout)
+		defer cancel()
+
+		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
+			errs = append(errs, fmt.Errorf("failed to shutdown HTTP server: %w", err))
+		}
+	}
+
+	// Clear listener reference (already closed by httpServer.Shutdown)
+	s.listenerMu.Lock()
+	s.listener = nil
+	s.listenerMu.Unlock()
+
+	// Stop session manager after HTTP server shutdown
+	if s.sessionManager != nil {
+		if err := s.sessionManager.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to stop session manager: %w", err))
+		}
+	}
+
+	// Stop health monitor to clean up health check goroutines
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	if healthMon != nil {
+		if err := healthMon.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("failed to stop health monitor: %w", err))
+		}
+	}
+
+	// Run shutdown functions (e.g., status reporter cleanup, future components)
+	for _, shutdown := range s.shutdownFuncs {
+		if err := shutdown(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("failed to execute shutdown function: %w", err))
+		}
+	}
+
+	// Stop discovery manager to clean up background goroutines
+	if s.discoveryMgr != nil {
+		s.discoveryMgr.Stop()
+	}
+
+	if len(errs) > 0 {
+		slog.Error("errors during shutdown", "errors", errs)
+		return errors.Join(errs...)
+	}
+
+	slog.Info("virtual MCP Server stopped")
+	return nil
+}
+
+// Address returns the server's actual listen address.
+// If the server is started with port 0, this returns the actual bound port.
+func (s *Server) Address() string {
+	s.listenerMu.RLock()
+	defer s.listenerMu.RUnlock()
+
+	if s.listener != nil {
+		return s.listener.Addr().String()
+	}
+	return fmt.Sprintf("%s:%d", s.config.Host, s.config.Port)
+}
+
+// handleHealth handles /health and /ping HTTP requests.
+// Returns 200 OK if the server is running and able to respond.
+//
+// Security Note: This endpoint is unauthenticated and intentionally minimal.
+// It only confirms the HTTP server is responding. No version information,
+// session counts, or operational metrics are exposed to prevent information
+// disclosure in multi-tenant scenarios.
+//
+// For operational monitoring, implement an authenticated /metrics endpoint
+// that requires proper authorization.
+func (*Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	response := map[string]string{
+		"status": "ok",
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	// Always send 200 OK - even if JSON encoding fails below, the server is responding
+	w.WriteHeader(http.StatusOK)
+
+	// Encode response. If this fails (extremely unlikely for simple map[string]string),
+	// the 200 OK status has already been sent above.
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Error("failed to encode health response", "error", err)
+	}
+}
+
+// handleReadiness handles /readyz HTTP requests for Kubernetes readiness probes.
+//
+// In dynamic mode (K8s with outgoingAuth.source: discovered), this endpoint gates
+// readiness on the controller-runtime manager's cache sync status. The pod will
+// not be marked ready until the manager has populated its cache with current
+// backend information from the MCPGroup.
+//
+// In static mode (CLI or K8s with inline backends), this always returns 200 OK
+// since there's no cache to sync.
+//
+// Design Pattern:
+// This follows the same readiness gating pattern used by cert-manager and ArgoCD:
+// - /health: Always returns 200 if server is responding (liveness probe)
+// - /readyz: Returns 503 until caches synced, then 200 (readiness probe)
+//
+// K8s Configuration:
+//
+//	readinessProbe:
+//	  httpGet:
+//	    path: /readyz
+//	    port: 4483
+//	  initialDelaySeconds: 5
+//	  periodSeconds: 5
+//	  timeoutSeconds: 5
+func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
+	// Static mode: always ready (no watcher, no cache to sync)
+	if s.config.Watcher == nil {
+		response := map[string]string{
+			"status": "ready",
+			"mode":   "static",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			slog.Error("failed to encode readiness response", "error", err)
+		}
+		return
+	}
+
+	// Dynamic mode: gate readiness on cache sync
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if !s.config.Watcher.WaitForCacheSync(ctx) {
+		// Cache not synced yet - return 503 Service Unavailable
+		response := map[string]string{
+			"status": "not_ready",
+			"mode":   "dynamic",
+			"reason": "cache_sync_pending",
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		if err := json.NewEncoder(w).Encode(response); err != nil {
+			slog.Error("failed to encode readiness response", "error", err)
+		}
+		return
+	}
+
+	// Cache synced - ready to serve requests
+	response := map[string]string{
+		"status": "ready",
+		"mode":   "dynamic",
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		slog.Error("failed to encode readiness response", "error", err)
+	}
+}
+
+// SessionManager returns the session manager instance.
+// This is useful for testing and monitoring.
+func (s *Server) SessionManager() *transportsession.Manager {
+	return s.sessionManager
+}
+
+// Ready returns a channel that is closed when the server is ready to accept connections.
+// This is useful for testing and synchronization.
+func (s *Server) Ready() <-chan struct{} {
+	return s.ready
+}
+
+// setSessionResourcesDirect sets resources directly on the session via the SessionWithResources
+// interface, analogous to setSessionToolsDirect for resources.
+func setSessionResourcesDirect(session server.ClientSession, resources []server.ServerResource) error {
+	sessionWithResources, ok := session.(server.SessionWithResources)
+	if !ok {
+		return fmt.Errorf("session does not support per-session resources")
+	}
+
+	existing := sessionWithResources.GetSessionResources()
+	resourceMap := make(map[string]server.ServerResource, len(existing)+len(resources))
+	for k, v := range existing {
+		resourceMap[k] = v
+	}
+	for _, res := range resources {
+		resourceMap[res.Resource.URI] = res
+	}
+	sessionWithResources.SetSessionResources(resourceMap)
+	return nil
+}
+
+// setSessionToolsDirect sets tools directly on the session via the SessionWithTools
+// interface, bypassing MCPServer.AddSessionTools. This avoids sending notifications
+// through the session's notification channel, which would accumulate as stale
+// messages during session registration (the notification goroutine from the
+// initialize request has already exited at that point).
+func setSessionToolsDirect(session server.ClientSession, tools []server.ServerTool) error {
+	sessionWithTools, ok := session.(server.SessionWithTools)
+	if !ok {
+		return fmt.Errorf("session does not support per-session tools")
+	}
+
+	// Merge with any existing tools (preserves tools set by earlier calls)
+	existing := sessionWithTools.GetSessionTools()
+	toolMap := make(map[string]server.ServerTool, len(existing)+len(tools))
+	for k, v := range existing {
+		toolMap[k] = v
+	}
+	for _, tool := range tools {
+		toolMap[tool.Tool.Name] = tool
+	}
+	sessionWithTools.SetSessionTools(toolMap)
+	return nil
+}
+
+// handleSessionRegistration processes a new MCP session registration.
+// It fires AFTER the session is registered in the SDK.
+func (s *Server) handleSessionRegistration(
+	ctx context.Context,
+	session server.ClientSession,
+) {
+	// Error is logged and handled within handleSessionRegistrationImpl.
+	// The session is terminated on failure; no further action needed here.
+	_ = s.handleSessionRegistrationImpl(ctx, session)
+}
+
+// handleSessionRegistrationImpl handles session registration.
+//
+// It is invoked from handleSessionRegistration and:
+//  1. Creates a MultiSession with real backend HTTP connections via CreateSession().
+//  2. Retrieves SDK-format tools and resources with session-scoped routing handlers.
+//  3. Registers backend tools, composite tools, and resources with the SDK for the session.
+//
+// Tool and resource calls are routed directly through the session's backend connections
+// rather than through the global router and discovery middleware.
+// Composite tool executors use the shared backend client and router.
+//
+// # Current capability surface
+//
+//   - Optimizer mode: when configured, all tools (backend + composite) are
+//     indexed into the optimizer and only find_tool/call_tool are exposed,
+//     using session-scoped tool handlers.
+//
+//   - Prompts: not supported until the SDK adds AddSessionPrompts.
+func (s *Server) handleSessionRegistrationImpl(ctx context.Context, session server.ClientSession) (retErr error) {
+	sessionID := session.SessionID()
+	slog.Debug("creating session-scoped backends", "session_id", sessionID)
+
+	// Defer cleanup: if any error occurs, terminate the session and log failures.
+	defer func() {
+		if retErr != nil {
+			if _, termErr := s.vmcpSessionMgr.Terminate(sessionID); termErr != nil {
+				slog.Warn("failed to clean up session after error",
+					"session_id", sessionID,
+					"error", termErr,
+					"original_error", retErr)
+			}
+		}
+	}()
+
+	// NOTE: the initialize response (including the Mcp-Session-Id header) has
+	// already been sent to the client before this hook fires. Any error below
+	// terminates the session internally, but the client holds a session ID that
+	// will appear to have no tools (tool calls will return "not found" from the
+	// SDK). This is an architectural constraint of the two-phase pattern — there
+	// is no way to retract the session ID after it has been sent.
+	//
+	// NOTE: there is a brief race window between the client receiving the session
+	// ID and this hook completing. A client that pipelines a tools/call immediately
+	// after initialize may receive a "tool not found" error before AddSessionTools
+	// completes. Conforming MCP clients call tools/list before tools/call, so this
+	// window is expected to be harmless in practice.
+	if _, retErr = s.vmcpSessionMgr.CreateSession(ctx, sessionID); retErr != nil {
+		slog.Error("failed to create session-scoped backends",
+			"session_id", sessionID,
+			"error", retErr)
+		return retErr
+	}
+
+	adaptedTools, retErr := s.vmcpSessionMgr.GetAdaptedTools(sessionID)
+	if retErr != nil {
+		slog.Error("failed to get session-scoped tools",
+			"session_id", sessionID,
+			"error", retErr)
+		return retErr
+	}
+
+	adaptedResources, retErr := s.vmcpSessionMgr.GetAdaptedResources(sessionID)
+	if retErr != nil {
+		slog.Error("failed to get session-scoped resources",
+			"session_id", sessionID,
+			"error", retErr)
+		return retErr
+	}
+
+	// Collect composite SDK tools (with name-collision check against backend tools).
+	compositeSDKTools, retErr := s.collectCompositeTools(sessionID)
+	if retErr != nil {
+		return retErr
+	}
+
+	if len(adaptedResources) > 0 {
+		if err := setSessionResourcesDirect(session, adaptedResources); err != nil {
+			slog.Error("failed to add session resources", "session_id", sessionID, "error", err)
+			return err
+		}
+	}
+
+	return s.injectTools(ctx, session, adaptedTools, compositeSDKTools)
+}
+
+// collectCompositeTools converts workflow definitions to SDK tools,
+// validating that no composite tool name collides with a backend tool name.
+// Returns an empty slice (not an error) if no workflow defs are configured or conflicts are found.
+func (s *Server) collectCompositeTools(sessionID string) ([]server.ServerTool, error) {
+	if len(s.workflowDefs) == 0 {
+		return nil, nil
+	}
+
+	compositeTools := convertWorkflowDefsToTools(s.workflowDefs)
+	multiSess, hasSess := s.vmcpSessionMgr.GetMultiSession(sessionID)
+	if !hasSess {
+		slog.Error("session not found after creation; skipping composite tools",
+			"session_id", sessionID)
+		return nil, nil
+	}
+	if err := validateNoToolConflicts(multiSess.Tools(), compositeTools); err != nil {
+		slog.Error("composite tool name conflict detected; skipping composite tools",
+			"session_id", sessionID,
+			"error", err)
+		return nil, nil
+	}
+
+	sdkTools, err := s.capabilityAdapter.ToCompositeToolSDKTools(compositeTools, s.workflowExecutors)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert composite tools: %w", err)
+	}
+	return sdkTools, nil
+}
+
+// injectTools registers backend and composite tools into the session.
+// When the optimizer is configured, all tools are indexed and only
+// find_tool/call_tool are exposed; otherwise tools are registered directly.
+func (s *Server) injectTools(
+	ctx context.Context,
+	session server.ClientSession,
+	adaptedTools []server.ServerTool,
+	compositeSDKTools []server.ServerTool,
+) error {
+	sessionID := session.SessionID()
+
+	if s.config.OptimizerFactory != nil {
+		allTools := append(adaptedTools, compositeSDKTools...)
+		opt, err := s.config.OptimizerFactory(ctx, allTools)
+		if err != nil {
+			return fmt.Errorf("failed to create optimizer: %w", err)
+		}
+		if err = setSessionToolsDirect(session, adapter.CreateOptimizerTools(opt)); err != nil {
+			slog.Error("failed to add optimizer tools to session", "session_id", sessionID, "error", err)
+			return err
+		}
+		slog.Info("session capabilities injected (optimizer mode)",
+			"session_id", sessionID,
+			"indexed_tool_count", len(allTools))
+		return nil
+	}
+
+	if len(adaptedTools) > 0 {
+		if err := setSessionToolsDirect(session, adaptedTools); err != nil {
+			slog.Error("failed to add session tools", "session_id", sessionID, "error", err)
+			return err
+		}
+	}
+	if len(compositeSDKTools) > 0 {
+		if err := setSessionToolsDirect(session, compositeSDKTools); err != nil {
+			slog.Error("failed to add composite tools to session", "session_id", sessionID, "error", err)
+			return err
+		}
+		slog.Debug("added composite tools to session", "session_id", sessionID, "count", len(compositeSDKTools))
+	}
+
+	slog.Info("session capabilities injected",
+		"session_id", sessionID,
+		"tool_count", len(adaptedTools),
+		"composite_tool_count", len(compositeSDKTools))
+	return nil
+}
+
+// validateAndCreateExecutors validates workflow definitions and creates executors.
+//
+// This function:
+//  1. Validates each workflow definition (cycle detection, tool references, etc.)
+//  2. Returns error on first validation failure (fail-fast)
+//  3. Creates workflow executors for all valid workflows
+//
+// Failing fast on invalid workflows provides immediate user feedback and prevents
+// security issues (resource exhaustion from cycles, information disclosure from errors).
+func validateAndCreateExecutors(
+	validator composer.Composer,
+	workflowDefs map[string]*composer.WorkflowDefinition,
+) (map[string]*composer.WorkflowDefinition, map[string]adapter.WorkflowExecutor, error) {
+	if len(workflowDefs) == 0 {
+		return nil, nil, nil
+	}
+
+	validDefs := make(map[string]*composer.WorkflowDefinition, len(workflowDefs))
+	validExecutors := make(map[string]adapter.WorkflowExecutor, len(workflowDefs))
+
+	for name, def := range workflowDefs {
+		if err := validator.ValidateWorkflow(context.Background(), def); err != nil {
+			return nil, nil, fmt.Errorf("invalid workflow definition '%s': %w", name, err)
+		}
+
+		validDefs[name] = def
+		validExecutors[name] = newComposerWorkflowExecutor(validator, def)
+		slog.Debug("validated workflow definition", "name", name)
+	}
+
+	if len(validDefs) > 0 {
+		slog.Info("loaded valid composite tool workflows", "count", len(validDefs))
+	}
+
+	return validDefs, validExecutors, nil
+}
+
+// GetBackendHealthStatus returns the health status of a specific backend.
+// Returns error if health monitoring is disabled or backend not found.
+func (s *Server) GetBackendHealthStatus(backendID string) (vmcp.BackendHealthStatus, error) {
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	if healthMon == nil {
+		return vmcp.BackendUnknown, fmt.Errorf("health monitoring is disabled")
+	}
+	return healthMon.GetBackendStatus(backendID)
+}
+
+// GetBackendHealthState returns the full health state of a specific backend.
+// Returns error if health monitoring is disabled or backend not found.
+func (s *Server) GetBackendHealthState(backendID string) (*health.State, error) {
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	if healthMon == nil {
+		return nil, fmt.Errorf("health monitoring is disabled")
+	}
+	return healthMon.GetBackendState(backendID)
+}
+
+// GetAllBackendHealthStates returns the health states of all backends.
+// Returns empty map if health monitoring is disabled.
+func (s *Server) GetAllBackendHealthStates() map[string]*health.State {
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	if healthMon == nil {
+		return make(map[string]*health.State)
+	}
+	return healthMon.GetAllBackendStates()
+}
+
+// GetHealthSummary returns a summary of backend health across all backends.
+// Returns zero-valued summary if health monitoring is disabled.
+func (s *Server) GetHealthSummary() health.Summary {
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	if healthMon == nil {
+		return health.Summary{}
+	}
+	return healthMon.GetHealthSummary()
+}
+
+// BackendHealthResponse represents the health status response for all backends.
+type BackendHealthResponse struct {
+	// MonitoringEnabled indicates if health monitoring is active.
+	MonitoringEnabled bool `json:"monitoring_enabled"`
+
+	// Summary provides aggregate health statistics.
+	// Only populated if MonitoringEnabled is true.
+	Summary *health.Summary `json:"summary,omitempty"`
+
+	// Backends contains the detailed health state of each backend.
+	// Only populated if MonitoringEnabled is true.
+	Backends map[string]*health.State `json:"backends,omitempty"`
+}
+
+// handleBackendHealth handles /api/backends/health HTTP requests.
+// Returns 200 OK with backend health information.
+//
+// Security Note: This endpoint is unauthenticated and may expose backend topology.
+// Consider applying authentication middleware if operating in multi-tenant mode.
+func (s *Server) handleBackendHealth(w http.ResponseWriter, _ *http.Request) {
+	s.healthMonitorMu.RLock()
+	healthMon := s.healthMonitor
+	s.healthMonitorMu.RUnlock()
+
+	response := BackendHealthResponse{
+		MonitoringEnabled: healthMon != nil,
+	}
+
+	if healthMon != nil {
+		summary := s.GetHealthSummary()
+		response.Summary = &summary
+		response.Backends = s.GetAllBackendHealthStates()
+	}
+
+	// Encode response before writing headers to ensure encoding succeeds
+	data, err := json.Marshal(response)
+	if err != nil {
+		slog.Error("failed to encode backend health response", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write(data); err != nil {
+		slog.Error("failed to write backend health response", "error", err)
+	}
+}
+
+// notAcceptableBody is the JSON-RPC error returned when a GET request is missing
+// the Accept: text/event-stream header required by the Streamable HTTP transport.
+var notAcceptableBody = []byte(
+	`{"jsonrpc":"2.0","id":"server-error","error":` +
+		`{"code":-32600,"message":"Not Acceptable: Client must accept text/event-stream"}}`,
+)
+
+// headerValidatingMiddleware rejects GET requests that do not include
+// Accept: text/event-stream, as required by the MCP Streamable HTTP transport spec.
+func headerValidatingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet &&
+			!strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotAcceptable)
+			if _, err := w.Write(notAcceptableBody); err != nil {
+				slog.Error("failed to write not-acceptable response", "error", err)
+			}
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}

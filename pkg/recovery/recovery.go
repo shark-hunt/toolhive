@@ -1,0 +1,63 @@
+// SPDX-FileCopyrightText: Copyright 2025 Stacklok, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package recovery provides panic recovery middleware for HTTP handlers.
+package recovery
+
+import (
+	"fmt"
+	"log/slog"
+	"net/http"
+	"runtime/debug"
+
+	"github.com/stacklok/toolhive/pkg/transport/types"
+)
+
+// MiddlewareType is the type constant for recovery middleware
+const MiddlewareType = "recovery"
+
+// Middleware is an HTTP middleware that recovers from panics.
+// When a panic occurs, it logs the error and returns
+// a 500 Internal Server Error response to the client.
+func Middleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				// Re-panic http.ErrAbortHandler so Go's HTTP server can
+				// handle it as designed (silently close the connection).
+				// ReverseProxy panics with this sentinel when a streaming
+				// response breaks mid-copy; catching it would log noisy
+				// stack traces and corrupt the already-in-flight response.
+				if rec == http.ErrAbortHandler {
+					panic(http.ErrAbortHandler)
+				}
+				stack := debug.Stack()
+				slog.Error(fmt.Sprintf("Panic recovered: %v\nStack trace:\n%s", rec, stack))
+				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// FactoryMiddleware wraps recovery middleware functionality for the factory pattern.
+type FactoryMiddleware struct{}
+
+// Handler returns the middleware function used by the proxy.
+func (FactoryMiddleware) Handler() types.MiddlewareFunction {
+	return Middleware
+}
+
+// Close cleans up any resources used by the middleware.
+func (FactoryMiddleware) Close() error {
+	// Recovery middleware doesn't need cleanup
+	return nil
+}
+
+// CreateMiddleware is the factory function for recovery middleware.
+// It creates and registers the recovery middleware with the runner.
+func CreateMiddleware(_ *types.MiddlewareConfig, runner types.MiddlewareRunner) error {
+	recoveryMw := &FactoryMiddleware{}
+	runner.AddMiddleware(MiddlewareType, recoveryMw)
+	return nil
+}

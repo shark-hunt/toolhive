@@ -1,0 +1,864 @@
+// SPDX-FileCopyrightText: Copyright 2025 Stacklok, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+// Package transparent provides a transparent HTTP proxy implementation
+// that forwards requests to a destination without modifying them.
+package transparent
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"golang.org/x/exp/jsonrpc2"
+
+	"github.com/stacklok/toolhive/pkg/auth"
+	"github.com/stacklok/toolhive/pkg/healthcheck"
+	"github.com/stacklok/toolhive/pkg/transport/proxy/socket"
+	"github.com/stacklok/toolhive/pkg/transport/session"
+	"github.com/stacklok/toolhive/pkg/transport/types"
+)
+
+// TransparentProxy implements the Proxy interface as a transparent HTTP proxy
+// that forwards requests to a destination.
+// It's used by the SSE transport to forward requests to the container's HTTP server.
+//
+//nolint:revive // Intentionally named TransparentProxy despite package name
+type TransparentProxy struct {
+	// Basic configuration
+	host      string
+	port      int
+	targetURI string
+
+	// HTTP server
+	server *http.Server
+
+	// Middleware chain
+	middlewares []types.NamedMiddleware
+
+	// Mutex for protecting shared state
+	mutex sync.Mutex
+
+	// Track if Stop() has been called
+	stopped bool
+
+	// Shutdown channel
+	shutdownCh chan struct{}
+
+	// Health checker
+	healthChecker *healthcheck.HealthChecker
+
+	// Optional Prometheus metrics handler
+	prometheusHandler http.Handler
+
+	// Optional auth info handler
+	authInfoHandler http.Handler
+
+	// prefixHandlers is a map of path prefixes to HTTP handlers
+	// mounted before the catch-all proxy handler
+	prefixHandlers map[string]http.Handler
+
+	// Sessions for tracking state
+	sessionManager *session.Manager
+
+	// If mcp server has been initialized (atomic access)
+	isServerInitialized atomic.Bool
+
+	// Listener for the HTTP server
+	listener net.Listener
+
+	// Whether the target URI is remote
+	isRemote bool
+
+	// Transport type (sse, streamable-http)
+	transportType string
+
+	// Callback when health check fails (for remote servers)
+	onHealthCheckFailed types.HealthCheckFailedCallback
+
+	// Callback when 401 Unauthorized response is received (for bearer token authentication)
+	onUnauthorizedResponse types.UnauthorizedResponseCallback
+
+	// Response processor for transport-specific logic
+	responseProcessor ResponseProcessor
+
+	// Deprecated: SSE endpoint URL rewriting configuration (moved to SSEResponseProcessor)
+	// endpointPrefix is an explicit prefix to prepend to SSE endpoint URLs
+	endpointPrefix string
+
+	// remoteBasePath is the path prefix from the remote URL that must be prepended
+	// to incoming request paths before forwarding. For example, if the remote URL is
+	// https://mcp.asana.com/v2/mcp and a client sends to /mcp, the proxy must
+	// forward to /v2/mcp. Without this, the path prefix is lost because the target
+	// URI only contains the scheme and host.
+	remoteBasePath string
+
+	// remoteRawQuery holds the raw query string from the remote URL (e.g.,
+	// "toolsets=core,alerting" from "https://mcp.example.com/mcp?toolsets=core,alerting").
+	// When set, it is merged into every outbound request so query parameters
+	// from the original registration URL are never silently dropped.
+	remoteRawQuery string
+
+	// Deprecated: trustProxyHeaders indicates whether to trust X-Forwarded-* headers (moved to SSEResponseProcessor)
+	trustProxyHeaders bool
+
+	// Health check interval (default: 10 seconds)
+	healthCheckInterval time.Duration
+
+	// Health check retry delay (default: 5 seconds)
+	healthCheckRetryDelay time.Duration
+
+	// Health check ping timeout (default: 5 seconds)
+	healthCheckPingTimeout time.Duration
+
+	// Shutdown timeout for graceful HTTP server shutdown (default: 30 seconds)
+	shutdownTimeout time.Duration
+}
+
+const (
+	// DefaultHealthCheckInterval is the default interval for health checks
+	DefaultHealthCheckInterval = 10 * time.Second
+
+	// DefaultHealthCheckRetryDelay is the default delay between retry attempts
+	DefaultHealthCheckRetryDelay = 5 * time.Second
+
+	// defaultShutdownTimeout is the maximum time to wait for graceful HTTP server
+	// shutdown before force-closing connections.
+	defaultShutdownTimeout = 30 * time.Second
+
+	// defaultIdleTimeout is the maximum time to wait for the next request on a
+	// keep-alive connection. Matches the value used by the vMCP server.
+	defaultIdleTimeout = 120 * time.Second
+
+	// HealthCheckIntervalEnvVar is the environment variable name for configuring health check interval.
+	// This is primarily useful for testing with shorter intervals.
+	HealthCheckIntervalEnvVar = "TOOLHIVE_HEALTH_CHECK_INTERVAL"
+)
+
+// Option is a functional option for configuring TransparentProxy
+type Option func(*TransparentProxy)
+
+// withHealthCheckInterval sets the health check interval.
+// This is primarily useful for testing with shorter intervals.
+// Ignores non-positive intervals; default will be used.
+func withHealthCheckInterval(interval time.Duration) Option {
+	return func(p *TransparentProxy) {
+		if interval > 0 {
+			p.healthCheckInterval = interval
+		}
+	}
+}
+
+// withHealthCheckRetryDelay sets the health check retry delay.
+// This is primarily useful for testing with shorter delays.
+// Ignores non-positive delays; default will be used.
+func withHealthCheckRetryDelay(delay time.Duration) Option {
+	return func(p *TransparentProxy) {
+		if delay > 0 {
+			p.healthCheckRetryDelay = delay
+		}
+	}
+}
+
+// WithRemoteBasePath sets the base path prefix from the remote URL.
+// When set, incoming request paths are rewritten to include this prefix
+// before forwarding to the remote server.
+func WithRemoteBasePath(basePath string) Option {
+	return func(p *TransparentProxy) {
+		p.remoteBasePath = basePath
+	}
+}
+
+// WithRemoteRawQuery sets the raw query string from the remote URL.
+// When set, these query parameters are merged into every outbound request,
+// ensuring query parameters from the original registration URL are always forwarded.
+// Ignores empty strings; default (no query forwarding) will be used.
+func WithRemoteRawQuery(rawQuery string) Option {
+	return func(p *TransparentProxy) {
+		if rawQuery != "" {
+			p.remoteRawQuery = rawQuery
+		}
+	}
+}
+
+// withHealthCheckPingTimeout sets the health check ping timeout.
+// This is primarily useful for testing with shorter timeouts.
+// Ignores non-positive timeouts; default will be used.
+func withHealthCheckPingTimeout(timeout time.Duration) Option {
+	return func(p *TransparentProxy) {
+		if timeout > 0 {
+			p.healthCheckPingTimeout = timeout
+		}
+	}
+}
+
+// withShutdownTimeout sets the graceful shutdown timeout for the HTTP server.
+// This is primarily useful for testing with shorter timeouts.
+// Ignores non-positive timeouts; default will be used.
+func withShutdownTimeout(timeout time.Duration) Option {
+	return func(p *TransparentProxy) {
+		if timeout > 0 {
+			p.shutdownTimeout = timeout
+		}
+	}
+}
+
+// NewTransparentProxy creates a new transparent proxy with optional middlewares.
+// The endpointPrefix parameter specifies an explicit prefix to prepend to SSE endpoint URLs.
+// The trustProxyHeaders parameter indicates whether to trust X-Forwarded-* headers from reverse proxies.
+// The prefixHandlers parameter is a map of path prefixes to HTTP handlers mounted before the catch-all proxy handler.
+func NewTransparentProxy(
+	host string,
+	port int,
+	targetURI string,
+	prometheusHandler http.Handler,
+	authInfoHandler http.Handler,
+	prefixHandlers map[string]http.Handler,
+	enableHealthCheck bool,
+	isRemote bool,
+	transportType string,
+	onHealthCheckFailed types.HealthCheckFailedCallback,
+	onUnauthorizedResponse types.UnauthorizedResponseCallback,
+	endpointPrefix string,
+	trustProxyHeaders bool,
+	middlewares ...types.NamedMiddleware,
+) *TransparentProxy {
+	return NewTransparentProxyWithOptions(
+		host,
+		port,
+		targetURI,
+		prometheusHandler,
+		authInfoHandler,
+		prefixHandlers,
+		enableHealthCheck,
+		isRemote,
+		transportType,
+		onHealthCheckFailed,
+		onUnauthorizedResponse,
+		endpointPrefix,
+		trustProxyHeaders,
+		middlewares,
+	)
+}
+
+// getHealthCheckInterval returns the health check interval to use.
+// Uses TOOLHIVE_HEALTH_CHECK_INTERVAL environment variable if set and valid,
+// otherwise returns the default interval.
+func getHealthCheckInterval() time.Duration {
+	if val := os.Getenv(HealthCheckIntervalEnvVar); val != "" {
+		if d, err := time.ParseDuration(val); err == nil && d > 0 {
+			return d
+		}
+	}
+	return DefaultHealthCheckInterval
+}
+
+// NewTransparentProxyWithOptions creates a new transparent proxy with optional configuration.
+func NewTransparentProxyWithOptions(
+	host string,
+	port int,
+	targetURI string,
+	prometheusHandler http.Handler,
+	authInfoHandler http.Handler,
+	prefixHandlers map[string]http.Handler,
+	enableHealthCheck bool,
+	isRemote bool,
+	transportType string,
+	onHealthCheckFailed types.HealthCheckFailedCallback,
+	onUnauthorizedResponse types.UnauthorizedResponseCallback,
+	endpointPrefix string,
+	trustProxyHeaders bool,
+	middlewares []types.NamedMiddleware,
+	options ...Option,
+) *TransparentProxy {
+	proxy := &TransparentProxy{
+		host:                   host,
+		port:                   port,
+		targetURI:              targetURI,
+		middlewares:            middlewares,
+		shutdownCh:             make(chan struct{}),
+		prometheusHandler:      prometheusHandler,
+		authInfoHandler:        authInfoHandler,
+		prefixHandlers:         prefixHandlers,
+		sessionManager:         session.NewManager(session.DefaultSessionTTL, session.NewProxySession),
+		isRemote:               isRemote,
+		transportType:          transportType,
+		onHealthCheckFailed:    onHealthCheckFailed,
+		onUnauthorizedResponse: onUnauthorizedResponse,
+		endpointPrefix:         endpointPrefix,
+		trustProxyHeaders:      trustProxyHeaders,
+		healthCheckInterval:    getHealthCheckInterval(),
+		healthCheckRetryDelay:  DefaultHealthCheckRetryDelay,
+		healthCheckPingTimeout: DefaultPingerTimeout,
+		shutdownTimeout:        defaultShutdownTimeout,
+	}
+
+	// Apply options
+	for _, opt := range options {
+		opt(proxy)
+	}
+
+	// Create appropriate response processor based on transport type
+	proxy.responseProcessor = createResponseProcessor(
+		transportType,
+		proxy,
+		endpointPrefix,
+		trustProxyHeaders,
+	)
+
+	// Create health checker always for Kubernetes probes
+	var mcpPinger healthcheck.MCPPinger
+	if enableHealthCheck {
+		pingTimeout := proxy.healthCheckPingTimeout
+		if pingTimeout == 0 {
+			pingTimeout = DefaultPingerTimeout
+		}
+		mcpPinger = NewMCPPingerWithTimeout(targetURI, pingTimeout)
+	}
+	proxy.healthChecker = healthcheck.NewHealthChecker(transportType, mcpPinger)
+
+	return proxy
+}
+
+type tracingTransport struct {
+	base http.RoundTripper
+	p    *TransparentProxy
+}
+
+func (p *TransparentProxy) setServerInitialized() {
+	if p.isServerInitialized.CompareAndSwap(false, true) {
+		//nolint:gosec // G706: logging target URI from config
+		slog.Debug("server was initialized successfully", "target", p.targetURI)
+	}
+}
+
+// serverInitialized returns whether the server has been initialized (thread-safe)
+func (p *TransparentProxy) serverInitialized() bool {
+	return p.isServerInitialized.Load()
+}
+
+func (t *tracingTransport) forward(req *http.Request) (*http.Response, error) {
+	tr := t.base
+	if tr == nil {
+		tr = http.DefaultTransport
+	}
+	return tr.RoundTrip(req)
+}
+
+// nolint:gocyclo // This function handles multiple request types and is complex by design
+func (t *tracingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Always rewrite Host header to match the target URL to avoid "Invalid Host" errors
+	// from backends with strict host validation (e.g., Django ALLOWED_HOSTS, FastAPI TrustedHostMiddleware).
+	// Without this, the backend receives the proxy's Host header (e.g., Kubernetes service DNS name)
+	// instead of its own hostname, causing validation failures.
+	// See: https://github.com/stacklok/stacklok-epics/issues/231
+	if req.URL.Host != req.Host {
+		req.Host = req.URL.Host
+	}
+
+	reqBody := readRequestBody(req)
+
+	// thv proxy does not provide the transport type, so we need to detect it from the request
+	path := req.URL.Path
+	isMCP := strings.HasPrefix(path, "/mcp")
+	isJSON := strings.Contains(req.Header.Get("Content-Type"), "application/json")
+	sawInitialize := false
+
+	if len(reqBody) > 0 &&
+		((isMCP && isJSON) ||
+			t.p.transportType == types.TransportTypeStreamableHTTP.String()) {
+		sawInitialize = t.detectInitialize(reqBody)
+	}
+
+	resp, err := t.forward(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			// Expected during shutdown or client disconnect—silently ignore
+			return nil, err
+		}
+		slog.Error("failed to forward request", "error", err)
+		return nil, err
+	}
+
+	// Check for 401 Unauthorized response (bearer token authentication failure)
+	if resp.StatusCode == http.StatusUnauthorized {
+		//nolint:gosec // G706: logging target URI from config
+		slog.Debug("received 401 Unauthorized response, bearer token may be invalid",
+			"target", t.p.targetURI)
+		if t.p.onUnauthorizedResponse != nil {
+			t.p.onUnauthorizedResponse()
+		}
+	}
+
+	// Clean up session on DELETE so the transparent proxy's session manager
+	// doesn't hold references until TTL expiry (#4062).
+	// Remove on 2xx (successful termination) and 404 (upstream already
+	// considers the session gone), since in both cases keeping a local
+	// reference would only waste memory.
+	if req.Method == http.MethodDelete &&
+		(resp.StatusCode >= 200 && resp.StatusCode < 300 || resp.StatusCode == http.StatusNotFound) {
+		if sid := req.Header.Get("Mcp-Session-Id"); sid != "" {
+			if err := t.p.sessionManager.Delete(sid); err != nil {
+				slog.Debug("failed to delete session from transparent proxy",
+					"session_id", sid, "error", err)
+			}
+		}
+	}
+
+	if resp.StatusCode == http.StatusOK {
+		// check if we saw a valid mcp header
+		ct := resp.Header.Get("Mcp-Session-Id")
+		if ct != "" {
+			//nolint:gosec // G706: logging session ID from HTTP response header
+			slog.Debug("detected Mcp-Session-Id header", "session_id", ct)
+			if _, ok := t.p.sessionManager.Get(ct); !ok {
+				if err := t.p.sessionManager.AddWithID(ct); err != nil {
+					//nolint:gosec // G706: session ID from HTTP response header
+					slog.Error("failed to create session from header",
+						"session_id", ct, "error", err)
+				}
+			}
+			t.p.setServerInitialized()
+			return resp, nil
+		}
+		// status was ok and we saw an initialize call
+		if sawInitialize && !t.p.serverInitialized() {
+			t.p.setServerInitialized()
+			return resp, nil
+		}
+	}
+
+	return resp, nil
+}
+
+func readRequestBody(req *http.Request) []byte {
+	reqBody := []byte{}
+	if req.Body != nil {
+		buf, err := io.ReadAll(req.Body)
+		if err != nil {
+			slog.Warn("failed to read request body", "error", err)
+		} else {
+			reqBody = buf
+		}
+		req.Body = io.NopCloser(bytes.NewReader(reqBody))
+	}
+	return reqBody
+}
+
+func (t *tracingTransport) detectInitialize(body []byte) bool {
+	var rpc struct {
+		Method string `json:"method"`
+	}
+	if err := json.Unmarshal(body, &rpc); err != nil {
+		slog.Debug("failed to parse JSON-RPC body", "error", err)
+		return false
+	}
+	if rpc.Method == "initialize" {
+		//nolint:gosec // G706: logging target URI from config
+		slog.Debug("detected initialize method call", "target", t.p.targetURI)
+		return true
+	}
+	return false
+}
+
+// modifyResponse modifies HTTP responses based on transport-specific requirements.
+// Delegates to the appropriate ResponseProcessor based on transport type.
+func (p *TransparentProxy) modifyResponse(resp *http.Response) error {
+	return p.responseProcessor.ProcessResponse(resp)
+}
+
+// Start starts the transparent proxy.
+// nolint:gocyclo // This function handles multiple startup scenarios and is complex by design
+func (p *TransparentProxy) Start(ctx context.Context) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	// Guard against calling Start() after Stop()
+	if p.stopped {
+		return fmt.Errorf("proxy has been stopped")
+	}
+
+	// Parse the target URI
+	targetURL, err := url.Parse(p.targetURI)
+	if err != nil {
+		return fmt.Errorf("failed to parse target URI: %w", err)
+	}
+
+	// Create a reverse proxy
+	proxy := &httputil.ReverseProxy{
+		FlushInterval: -1,
+		Rewrite: func(pr *httputil.ProxyRequest) {
+			pr.SetURL(targetURL)
+			pr.SetXForwarded()
+
+			// Stash the original inbound request in the outbound request's
+			// context so that ModifyResponse (SSE response processor) can
+			// read the client's real headers instead of the auto-injected
+			// X-Forwarded-* values that SetXForwarded() wrote to pr.Out.
+			ctx := InboundRequestToContext(pr.Out.Context(), pr.In)
+			pr.Out = pr.Out.WithContext(ctx)
+
+			// Rewrite path to the remote server's path when configured.
+			// When the remote URL has a path (e.g., /v2/mcp), the target URI only
+			// contains the scheme+host. The client sends to /mcp (default MCP
+			// endpoint) but the remote server expects /v2/mcp. We replace the
+			// request path with the remote server's configured path.
+			if p.remoteBasePath != "" {
+				pr.Out.URL.Path = p.remoteBasePath
+				pr.Out.URL.RawPath = ""
+			}
+
+			// Merge query parameters from the remote URL into the outbound request.
+			// Remote params are prepended so they appear first; most HTTP servers
+			// adopt first-value-wins semantics for duplicate keys, ensuring operator
+			// configured values (e.g., toolsets=core,alerting) take precedence over
+			// any client-supplied params with the same key.
+			// Raw string concatenation is intentional: url.Values.Encode() would
+			// percent-encode characters like commas that some APIs expect as literals.
+			if p.remoteRawQuery != "" {
+				merged := p.remoteRawQuery
+				if pr.Out.URL.RawQuery != "" {
+					merged += "&" + pr.Out.URL.RawQuery
+				}
+				pr.Out.URL.RawQuery = merged
+			}
+
+			// Inject OpenTelemetry trace propagation headers for downstream tracing
+			if pr.Out.Context() != nil {
+				otel.GetTextMapPropagator().Inject(pr.Out.Context(), propagation.HeaderCarrier(pr.Out.Header))
+			}
+		},
+	}
+
+	proxy.Transport = &tracingTransport{base: http.DefaultTransport, p: p}
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		return p.modifyResponse(resp)
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r) // #nosec G704 -- target URL is the configured backend MCP server
+	})
+
+	// Create a mux to handle both proxy and health endpoints
+	mux := http.NewServeMux()
+
+	// Apply middleware chain in reverse order (last middleware is applied first)
+	var finalHandler http.Handler = handler
+	for i := len(p.middlewares) - 1; i >= 0; i-- {
+		finalHandler = p.middlewares[i].Function(finalHandler)
+		slog.Debug("applied middleware", "name", p.middlewares[i].Name)
+	}
+
+	// 1. Mount prefix handlers first (user-specified, most specific paths)
+	// These are registered first but Go's ServeMux longest-match routing ensures
+	// more specific paths take precedence regardless of registration order.
+	for prefix, prefixHandler := range p.prefixHandlers {
+		mux.Handle(prefix, prefixHandler)
+		slog.Debug("mounted prefix handler", "prefix", prefix)
+	}
+
+	// 2. Mount health check endpoint if enabled, otherwise return 404
+	// (prevents /health from being proxied to the backend)
+	if p.healthChecker != nil {
+		mux.Handle("/health", p.healthChecker)
+	} else {
+		mux.HandleFunc("/health", http.NotFound)
+	}
+
+	// 3. Mount Prometheus metrics endpoint if handler is provided (no middlewares)
+	if p.prometheusHandler != nil {
+		mux.Handle("/metrics", p.prometheusHandler)
+		slog.Debug("prometheus metrics endpoint enabled at /metrics")
+	}
+
+	// 4. Mount RFC 9728 OAuth Protected Resource discovery endpoint (no middlewares)
+	// Note: This is DIFFERENT from the auth server's /.well-known/oauth-authorization-server
+	// We mount at specific paths to allow prefix handlers to register other well-known paths.
+	if wellKnownHandler := auth.NewWellKnownHandler(p.authInfoHandler); wellKnownHandler != nil {
+		mux.Handle("/.well-known/oauth-protected-resource", wellKnownHandler)
+		mux.Handle("/.well-known/oauth-protected-resource/", wellKnownHandler)
+		slog.Debug("rfc 9728 OAuth discovery endpoint enabled at /.well-known/oauth-protected-resource")
+	}
+
+	// 5. Catch-all proxy handler (least specific - ServeMux routing handles precedence)
+	// Note: No manual path checking needed - ServeMux longest-match routing ensures
+	// more specific paths registered above take precedence over this catch-all
+	mux.Handle("/", finalHandler)
+
+	// Use ListenConfig with SO_REUSEADDR to allow port reuse after unclean shutdown
+	// (e.g., after laptop sleep where zombie processes may hold ports)
+	lc := socket.ListenConfig()
+	ln, err := lc.Listen(context.Background(), "tcp", fmt.Sprintf("%s:%d", p.host, p.port))
+	if err != nil {
+		return fmt.Errorf("failed to listen: %w", err)
+	}
+	p.listener = ln
+
+	// Create the server
+	p.server = &http.Server{
+		Addr:              fmt.Sprintf("%s:%d", p.host, p.port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,   // Prevent Slowloris attacks
+		IdleTimeout:       defaultIdleTimeout, // Prevent idle keep-alive connections from blocking Shutdown()
+	}
+
+	// Capture server in local variable to avoid race with Stop()
+	server := p.server
+	go func() {
+		err := server.Serve(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			var opErr *net.OpError
+			if errors.As(err, &opErr) && opErr.Op == "accept" {
+				// Expected when listener is closed—silently return
+				return
+			}
+			slog.Error("transparent proxy error", "error", err)
+		}
+	}()
+	// Start health-check monitoring only if health checker is enabled
+	if p.healthChecker != nil {
+		go p.monitorHealth(ctx)
+	}
+
+	return nil
+}
+
+// ListenerAddr returns the network address the proxy is listening on.
+// Returns an empty string if the proxy has not been started.
+func (p *TransparentProxy) ListenerAddr() string {
+	if p.listener == nil {
+		return ""
+	}
+	return p.listener.Addr().String()
+}
+
+// CloseListener closes the listener for the transparent proxy.
+func (p *TransparentProxy) CloseListener() error {
+	if p.listener != nil {
+		return p.listener.Close()
+	}
+	return nil
+}
+
+// healthCheckRetryConfig holds retry configuration for health checks.
+// These values are designed to handle transient network issues like
+// VPN/firewall idle connection timeouts (commonly 5-10 minutes).
+const (
+	// healthCheckRetryCount is the number of consecutive failures before marking unhealthy.
+	// This prevents immediate shutdown on transient network issues.
+	healthCheckRetryCount = 3
+)
+
+// performHealthCheckRetry performs a retry health check after a delay
+// Returns true if the retry was successful (health check recovered), false otherwise
+func (p *TransparentProxy) performHealthCheckRetry(ctx context.Context) bool {
+	retryDelay := p.healthCheckRetryDelay
+	if retryDelay == 0 {
+		retryDelay = DefaultHealthCheckRetryDelay
+	}
+
+	retryTimer := time.NewTimer(retryDelay)
+	defer retryTimer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-p.shutdownCh:
+		return false
+	case <-retryTimer.C:
+		retryAlive := p.healthChecker.CheckHealth(ctx)
+		if retryAlive.Status == healthcheck.StatusHealthy {
+			//nolint:gosec // G706: logging target URI from config
+			slog.Debug("health check recovered after retry", "target", p.targetURI)
+			return true
+		}
+		return false
+	}
+}
+
+// handleHealthCheckFailure handles a failed health check, including retry logic and shutdown.
+// Returns (updatedFailureCount, shouldContinue) - true if monitoring should continue, false if it should stop.
+func (p *TransparentProxy) handleHealthCheckFailure(
+	ctx context.Context,
+	consecutiveFailures int,
+	status healthcheck.HealthStatus,
+) (int, bool) {
+	consecutiveFailures++
+	//nolint:gosec // G706: logging target URI from config and health status
+	slog.Warn("health check failed",
+		"target", p.targetURI,
+		"attempt", consecutiveFailures,
+		"max_attempts", healthCheckRetryCount,
+		"status", status)
+
+	if consecutiveFailures < healthCheckRetryCount {
+		if p.performHealthCheckRetry(ctx) {
+			consecutiveFailures = 0
+		}
+		return consecutiveFailures, true
+	}
+
+	// All retries exhausted, initiate shutdown
+	//nolint:gosec // G706: logging target URI from config
+	slog.Error("health check failed after consecutive attempts; initiating proxy shutdown",
+		"target", p.targetURI, "attempts", healthCheckRetryCount)
+	if p.onHealthCheckFailed != nil {
+		p.onHealthCheckFailed()
+	}
+	if err := p.Stop(ctx); err != nil {
+		slog.Error("failed to stop proxy",
+			"target", p.targetURI, "error", err)
+	}
+	return consecutiveFailures, false
+}
+
+func (p *TransparentProxy) monitorHealth(parentCtx context.Context) {
+	interval := p.healthCheckInterval
+	if interval == 0 {
+		interval = DefaultHealthCheckInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	consecutiveFailures := 0
+
+	for {
+		select {
+		case <-parentCtx.Done():
+			//nolint:gosec // G706: logging target URI from config
+			slog.Debug("context cancelled, stopping health monitor", "target", p.targetURI)
+			return
+		case <-p.shutdownCh:
+			//nolint:gosec // G706: logging target URI from config
+			slog.Debug("shutdown initiated, stopping health monitor", "target", p.targetURI)
+			return
+		case <-ticker.C:
+			if !p.serverInitialized() {
+				//nolint:gosec // G706: logging target URI from config
+				slog.Debug("mcp server not initialized yet, skipping health check",
+					"target", p.targetURI)
+				continue
+			}
+
+			alive := p.healthChecker.CheckHealth(parentCtx)
+			if alive.Status != healthcheck.StatusHealthy {
+				var shouldContinue bool
+				consecutiveFailures, shouldContinue = p.handleHealthCheckFailure(parentCtx, consecutiveFailures, alive.Status)
+				if !shouldContinue {
+					return
+				}
+				continue
+			}
+
+			// Reset failure count on successful health check
+			if consecutiveFailures > 0 {
+				//nolint:gosec // G706: logging target URI from config
+				slog.Debug("health check recovered",
+					"target", p.targetURI, "previous_failures", consecutiveFailures)
+			}
+			consecutiveFailures = 0
+		}
+	}
+}
+
+// Stop stops the transparent proxy.
+func (p *TransparentProxy) Stop(ctx context.Context) error {
+	p.mutex.Lock()
+
+	// Check if already stopped
+	if p.stopped {
+		p.mutex.Unlock()
+		//nolint:gosec // G706: logging target URI from config
+		slog.Debug("proxy is already stopped, skipping", "target", p.targetURI)
+		return nil
+	}
+
+	// Mark as stopped and signal shutdown under the lock
+	p.stopped = true
+	close(p.shutdownCh)
+
+	// Capture server reference and nil it out under the lock so no other
+	// goroutine can race on p.server after we release the mutex.
+	server := p.server
+	p.server = nil
+
+	// Release the lock before server.Shutdown() so IsRunning() is not blocked
+	// while long-lived connections drain.
+	p.mutex.Unlock()
+
+	if server != nil {
+		// Use the caller's context if still valid; fall back to a fresh one
+		// when the caller's context is already cancelled (e.g. the health
+		// monitor calls Stop() after its parent context is done).
+		base := ctx
+		if base.Err() != nil {
+			base = context.Background()
+		}
+		shutdownCtx, cancel := context.WithTimeout(base, p.shutdownTimeout)
+		defer cancel()
+
+		err := server.Shutdown(shutdownCtx)
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				// Graceful shutdown timed out — force-close remaining connections
+				slog.Warn("graceful shutdown timed out, force-closing connections",
+					"target", p.targetURI, "timeout", p.shutdownTimeout)
+				if closeErr := server.Close(); closeErr != nil {
+					slog.Warn("error during forced server close", "error", closeErr)
+				}
+			} else if !errors.Is(err, http.ErrServerClosed) {
+				slog.Warn("error during proxy shutdown", "error", err)
+				return err
+			}
+		}
+		//nolint:gosec // G706: logging target URI from config
+		slog.Debug("server stopped successfully", "target", p.targetURI)
+	}
+
+	return nil
+}
+
+// IsRunning checks if the proxy is running.
+func (p *TransparentProxy) IsRunning() (bool, error) {
+	// No mutex needed: shutdownCh is closed under the lock in Stop(),
+	// and a select on a closed channel is goroutine-safe by design.
+	select {
+	case <-p.shutdownCh:
+		return false, nil
+	default:
+		return true, nil
+	}
+}
+
+// GetMessageChannel returns the channel for messages to/from the destination.
+// This is not used in the TransparentProxy implementation as it forwards HTTP requests directly.
+func (*TransparentProxy) GetMessageChannel() chan jsonrpc2.Message {
+	return nil
+}
+
+// SendMessageToDestination sends a message to the destination.
+// This is not used in the TransparentProxy implementation as it forwards HTTP requests directly.
+func (*TransparentProxy) SendMessageToDestination(_ jsonrpc2.Message) error {
+	return fmt.Errorf("SendMessageToDestination not implemented for TransparentProxy")
+}
+
+// ForwardResponseToClients forwards a response from the destination to clients.
+// This is not used in the TransparentProxy implementation as it forwards HTTP requests directly.
+func (*TransparentProxy) ForwardResponseToClients(_ context.Context, _ jsonrpc2.Message) error {
+	return fmt.Errorf("ForwardResponseToClients not implemented for TransparentProxy")
+}

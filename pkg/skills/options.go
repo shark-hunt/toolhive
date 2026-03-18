@@ -1,0 +1,104 @@
+// SPDX-FileCopyrightText: Copyright 2025 Stacklok, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+package skills
+
+// ListOptions configures the behavior of the List operation.
+type ListOptions struct {
+	// Scope filters results by installation scope.
+	Scope Scope `json:"scope,omitempty"`
+	// ClientApp filters results by client application.
+	ClientApp string `json:"client,omitempty"`
+	// ProjectRoot filters results by project root path.
+	ProjectRoot string `json:"project_root,omitempty"`
+	// Group filters results to only skills that belong to the specified group.
+	Group string `json:"group,omitempty"`
+}
+
+// InstallOptions configures the behavior of the Install operation.
+type InstallOptions struct {
+	// Name is the skill name or OCI reference to install.
+	Name string `json:"name"`
+	// Version is the specific version to install. Empty means latest.
+	Version string `json:"version,omitempty"`
+	// Scope is the installation scope.
+	Scope Scope `json:"scope,omitempty"`
+	// Client is the target client (e.g., "claude-code"). Empty means first skill-supporting client.
+	Client string `json:"client,omitempty"`
+	// Force allows overwriting unmanaged skill directories.
+	Force bool `json:"force,omitempty"`
+	// ProjectRoot is the project root path for project-scoped installs.
+	ProjectRoot string `json:"project_root,omitempty"`
+	// Group is the group name to add the skill to after installation.
+	Group string `json:"group,omitempty"`
+	// LayerData is the tar.gz content from an OCI layer. Internal use only — NOT exposed via HTTP API.
+	LayerData []byte `json:"-"`
+	// Reference is the full OCI reference (e.g. ghcr.io/org/skill:v1).
+	Reference string `json:"-"`
+	// Digest is the OCI digest for upgrade detection.
+	Digest string `json:"-"`
+}
+
+// InstallResult contains the outcome of an Install operation.
+type InstallResult struct {
+	// Skill is the installed skill.
+	Skill InstalledSkill `json:"skill"`
+}
+
+// UninstallOptions configures the behavior of the Uninstall operation.
+type UninstallOptions struct {
+	// Name is the skill name to uninstall.
+	Name string `json:"name"`
+	// Scope is the scope from which to uninstall.
+	Scope Scope `json:"scope,omitempty"`
+	// ProjectRoot is the project root path for project-scoped skills.
+	ProjectRoot string `json:"project_root,omitempty"`
+}
+
+// InfoOptions configures the behavior of the Info operation.
+type InfoOptions struct {
+	// Name is the skill name to look up.
+	Name string `json:"name"`
+	// Scope filters the lookup by installation scope.
+	Scope Scope `json:"scope,omitempty"`
+	// ProjectRoot filters the lookup by project root path.
+	ProjectRoot string `json:"project_root,omitempty"`
+}
+
+// SkillInfo contains detailed information about an installed skill.
+type SkillInfo struct {
+	// Metadata contains the skill's metadata.
+	Metadata SkillMetadata `json:"metadata"`
+	// InstalledSkill contains the full installation record.
+	InstalledSkill *InstalledSkill `json:"installed_skill,omitempty"`
+}
+
+// ValidationResult contains the outcome of a Validate operation.
+type ValidationResult struct {
+	// Valid indicates whether the skill definition is valid.
+	Valid bool `json:"valid"`
+	// Errors is a list of validation errors, if any.
+	Errors []string `json:"errors,omitempty"`
+	// Warnings is a list of non-blocking validation warnings, if any.
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// BuildOptions configures the behavior of the Build operation.
+type BuildOptions struct {
+	// Path is the local directory path containing the skill definition.
+	Path string `json:"path"`
+	// Tag is the OCI tag to use for the built artifact.
+	Tag string `json:"tag,omitempty"`
+}
+
+// BuildResult contains the outcome of a Build operation.
+type BuildResult struct {
+	// Reference is the OCI reference of the built skill artifact.
+	Reference string `json:"reference"`
+}
+
+// PushOptions configures the behavior of the Push operation.
+type PushOptions struct {
+	// Reference is the OCI reference to push.
+	Reference string `json:"reference"`
+}
